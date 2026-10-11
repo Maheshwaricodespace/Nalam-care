@@ -847,6 +847,68 @@ def get_alerts():
     alerts = fetch_alerts_data(conn, facility)
     conn.close()
     return jsonify(alerts), 200
+def build_transfer_recommendations(conn, facility=None):
+    """Recommend moving surplus stock from high-stock facilities to low-stock facilities."""
+    stock_rows = fetch_stock_data(conn)  # all facilities, batch level
+    meds = {}
+    for r in conn.execute("SELECT id, name, strength, unit, min_stock_level FROM medicines WHERE min_stock_level > 0"):
+        meds[r["id"]] = dict(r)
+    fac_names = [r["name"] for r in conn.execute("SELECT name FROM facilities ORDER BY id")]
+
+    usable = {}
+    batches = {}
+    for s in stock_rows:
+        if s["is_expired"]:
+            continue
+        key = (s["medicine_id"], s["facility_name"])
+        usable[key] = usable.get(key, 0) + s["current_stock"]
+        batches.setdefault(key, []).append(s)
+
+    recs = []
+    for mid, m in meds.items():
+        min_lvl = m["min_stock_level"]
+        target = min_lvl * 2  # healthy level = 2x safety minimum
+        for low in fac_names:
+            have = usable.get((mid, low), 0)
+            if have > min_lvl:
+                continue
+            need = target - have
+            donors = []
+            for d in fac_names:
+                if d == low:
+                    continue
+                spare = usable.get((mid, d), 0) - target
+                if spare > 0:
+                    donors.append((spare, d))
+            if not donors:
+                continue
+            donors.sort(reverse=True)  # highest surplus first
+            spare, donor = donors[0]
+            qty = min(need, spare)
+            batch = sorted(batches[(mid, donor)], key=lambda b: b["expiry_date"])[0]
+            qty = min(qty, batch["current_stock"])
+            if qty <= 0:
+                continue
+            if facility and facility not in (low, donor):
+                continue
+            usable[(mid, donor)] = usable.get((mid, donor), 0) - qty  # don't over-promise one donor
+            recs.append({
+                "medicine_id": mid,
+                "medicine_name": m["name"],
+                "strength": m["strength"],
+                "unit": m["unit"],
+                "min_stock_level": min_lvl,
+                "low_facility": low,
+                "low_facility_stock": have,
+                "donor_facility": donor,
+                "donor_facility_stock": usable.get((mid, donor), 0) + qty,
+                "suggested_quantity": int(qty),
+                "batch_id": batch["batch_id"],
+                "batch_number": batch["batch_number"],
+                "severity": "CRITICAL" if have == 0 else "HIGH",
+            })
+    recs.sort(key=lambda r: (r["severity"] != "CRITICAL", r["low_facility_stock"]))
+    return recs
 
 @app.route("/api/dashboard", methods=["GET"], strict_slashes=False)
 def get_dashboard():
@@ -883,6 +945,8 @@ def get_dashboard():
     """, params)
     recent_transactions = [dict(r) for r in cursor.fetchall()]
 
+    transfer_recs = build_transfer_recommendations(conn, facility)
+
     conn.close()
 
     return jsonify({
@@ -899,6 +963,8 @@ def get_dashboard():
             "early_warnings_count": alerts_data["summary"]["forecast_warnings"]
         },
         "alerts_summary": alerts_data["summary"],
+        "alerts_summary": alerts_data["summary"],
+        "transfer_recommendations": transfer_recs,
         "recent_movements": recent_transactions,
         "critical_alerts": alerts_data["stockout_alerts"] + alerts_data["forecast_warnings"]
     }), 200
@@ -995,7 +1061,282 @@ def handle_405(e):
 @app.errorhandler(500)
 def handle_500(e):
     return jsonify({"error": "Internal server error.", "status_code": 500}), 500
+    # ==============================================================================
+# BARCODE SALES SCANNER (sample barcodes)
+# Scan a medicine barcode while selling -> stock is deducted (ISSUE) and the
+# response shows how much was sold and how much stock is left.
+# Open http://127.0.0.1:5000/scanner in the browser to use it.
+# ==============================================================================
+from flask import Response
 
+# Sample barcodes (EAN-13) for two medicines only. Add real barcodes here later.
+SAMPLE_BARCODES = {
+    "8901234560013": "MED-PAR-500",   # Paracetamol 500 mg
+    "8901234560020": "MED-MET-500",   # Metformin 500 mg
+}
+
+def _get_medicine_for_barcode(conn, barcode):
+    medicine_code = SAMPLE_BARCODES.get(barcode)
+    if not medicine_code:
+        return None
+    return conn.execute(
+        "SELECT id, medicine_code, name, strength, unit, min_stock_level FROM medicines WHERE medicine_code = ?",
+        (medicine_code,)
+    ).fetchone()
+
+def _barcode_stock_summary(conn, medicine, facility):
+    """Sold today, sold overall and stock left for one medicine at one facility."""
+    today_str = date.today().isoformat()
+    meds = fetch_medicines_data(conn, facility)
+    m = next((x for x in meds if x["id"] == medicine["id"]), None)
+    stock_left = m["usable_stock"] if m else 0
+
+    sold_today = conn.execute("""
+        SELECT COALESCE(SUM(st.quantity), 0)
+        FROM stock_transactions st JOIN batches b ON st.batch_id = b.id
+        WHERE b.medicine_id = ? AND st.facility_name = ?
+          AND st.transaction_type = 'ISSUE' AND st.transaction_date = ?
+    """, (medicine["id"], facility, today_str)).fetchone()[0]
+
+    sold_total = conn.execute("""
+        SELECT COALESCE(SUM(st.quantity), 0)
+        FROM stock_transactions st JOIN batches b ON st.batch_id = b.id
+        WHERE b.medicine_id = ? AND st.facility_name = ? AND st.transaction_type = 'ISSUE'
+    """, (medicine["id"], facility)).fetchone()[0]
+
+    min_level = medicine["min_stock_level"] or 0
+    return {
+        "medicine_code": medicine["medicine_code"],
+        "medicine_name": medicine["name"],
+        "strength": medicine["strength"],
+        "unit": medicine["unit"],
+        "facility": facility,
+        "sold_today": sold_today,
+        "sold_total": sold_total,
+        "stock_left": stock_left,
+        "min_stock_level": min_level,
+        "low_stock": bool(min_level > 0 and stock_left <= min_level)
+    }
+
+@app.route("/api/barcodes", methods=["GET"], strict_slashes=False)
+def list_sample_barcodes():
+    """List the sample barcodes with live stock for a facility."""
+    facility = request.args.get("facility")
+    conn = get_db_connection()
+    result = []
+    for barcode in SAMPLE_BARCODES:
+        med = _get_medicine_for_barcode(conn, barcode)
+        if not med:
+            continue
+        item = {"barcode": barcode, "medicine_name": med["name"], "strength": med["strength"]}
+        if facility:
+            item.update(_barcode_stock_summary(conn, med, facility))
+        result.append(item)
+    conn.close()
+    return jsonify(result), 200
+
+@app.route("/api/barcode/<barcode>", methods=["GET"], strict_slashes=False)
+def lookup_barcode(barcode):
+    """Look up a barcode and show sold/stock numbers WITHOUT selling."""
+    facility = (request.args.get("facility") or "").strip()
+    if not facility:
+        return jsonify({"error": "facility is required."}), 400
+    conn = get_db_connection()
+    med = _get_medicine_for_barcode(conn, barcode.strip())
+    if not med:
+        conn.close()
+        return jsonify({"error": f"Barcode {barcode} is not registered."}), 404
+    summary = _barcode_stock_summary(conn, med, facility)
+    conn.close()
+    return jsonify(summary), 200
+
+@app.route("/api/barcode/sale", methods=["POST"], strict_slashes=False)
+def barcode_sale():
+    """
+    Scan-to-sell: deducts stock using the earliest-expiry batch first (FEFO),
+    records ISSUE transactions, and returns sold / remaining stock.
+    """
+    data = request.get_json() or {}
+    barcode = (data.get("barcode") or "").strip()
+    facility = (data.get("facility_name") or "").strip()
+    performed_by = (data.get("performed_by") or "Barcode Scanner").strip()
+
+    if not barcode or not facility:
+        return jsonify({"error": "barcode and facility_name are required."}), 400
+
+    try:
+        quantity = int(data.get("quantity", 1))
+        if quantity <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"error": "quantity must be a positive whole number."}), 400
+
+    conn = get_db_connection()
+    try:
+        med = _get_medicine_for_barcode(conn, barcode)
+        if not med:
+            conn.close()
+            return jsonify({"error": f"Barcode {barcode} is not registered."}), 404
+
+        batches = [
+            s for s in fetch_stock_data(conn, facility)
+            if s["medicine_id"] == med["id"] and not s["is_expired"] and s["current_stock"] > 0
+        ]
+        batches.sort(key=lambda s: s["expiry_date"])
+        available = sum(s["current_stock"] for s in batches)
+
+        if quantity > available:
+            conn.close()
+            return jsonify({
+                "error": f"Insufficient stock. {med['name']} has only {available} usable {med['unit']} at {facility}."
+            }), 400
+
+        today_str = date.today().isoformat()
+        ref = f"SALE-{int(datetime.now().timestamp() * 1000)}"
+        remaining = quantity
+        with conn:
+            for b in batches:
+                if remaining <= 0:
+                    break
+                take = min(remaining, b["current_stock"])
+                conn.execute("""
+                    INSERT INTO stock_transactions (
+                        batch_id, transaction_type, quantity, transaction_date,
+                        facility_name, related_facility, reason, reference_number, performed_by
+                    ) VALUES (?, 'ISSUE', ?, ?, ?, NULL, ?, ?, ?)
+                """, (b["batch_id"], take, today_str, facility, "Barcode scan sale", ref, performed_by))
+                remaining -= take
+
+        summary = _barcode_stock_summary(conn, med, facility)
+        conn.close()
+        summary["sold_now"] = quantity
+        summary["reference_number"] = ref
+        summary["message"] = (
+            f"Sold {quantity} {med['unit']} of {med['name']}. Stock left: {summary['stock_left']}."
+            + (" Low stock - please raise a restock request." if summary["low_stock"] else "")
+        )
+        return jsonify(summary), 201
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": "Barcode sale failed: " + str(e)}), 500
+
+SCANNER_PAGE = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NalamCare - Barcode Sales Scanner</title>
+<style>
+  body{font-family:Segoe UI,Arial,sans-serif;background:#f1f5f9;margin:0;color:#0f172a}
+  header{background:#0f766e;color:#fff;padding:14px 20px;font-size:1.2rem;font-weight:600}
+  main{max-width:900px;margin:20px auto;padding:0 16px}
+  .card{background:#fff;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+  label{font-size:.8rem;color:#475569;display:block;margin-bottom:4px}
+  input,select{padding:10px;font-size:1rem;border:1px solid #cbd5e1;border-radius:6px}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+  button{background:#0f766e;color:#fff;border:0;border-radius:6px;padding:10px 18px;font-size:1rem;cursor:pointer}
+  button.sec{background:#e2e8f0;color:#0f172a}
+  .stats{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}
+  .stat{flex:1;min-width:140px;background:#f8fafc;border-radius:8px;padding:12px;text-align:center}
+  .stat b{display:block;font-size:1.6rem}
+  .ok{border-left:5px solid #16a34a}.err{border-left:5px solid #dc2626;color:#b91c1c}.warn{color:#b45309;font-weight:600}
+  .samples{display:flex;gap:16px;flex-wrap:wrap}
+  .sample{flex:1;min-width:250px;text-align:center;border:1px dashed #94a3b8;border-radius:8px;padding:12px}
+  .sample svg{max-width:100%}
+</style>
+</head>
+<body>
+<header>NalamCare - Barcode Sales Scanner</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <div><label>Facility</label><select id="facility"></select></div>
+      <div><label>Scan barcode here (scanner types + Enter)</label>
+        <input id="barcode" placeholder="Scan or type barcode" autofocus autocomplete="off" style="min-width:260px"></div>
+      <div><label>Quantity</label><input id="qty" type="number" min="1" value="1" style="width:80px"></div>
+      <button id="sellBtn">Sell</button>
+      <button id="checkBtn" class="sec">Check stock only</button>
+    </div>
+    <div id="result" style="margin-top:14px"></div>
+  </div>
+  <div class="card">
+    <b>Sample barcodes (for testing)</b>
+    <p style="font-size:.85rem;color:#475569;margin-top:4px">Scan these from the screen with a scanner, or click "Use this barcode".</p>
+    <div class="samples" id="samples"></div>
+  </div>
+</main>
+<script>
+const L=["0001101","0011001","0010011","0111101","0100011","0110001","0101111","0111011","0110111","0001011"];
+const G=["0100111","0110011","0011011","0100001","0011101","0111001","0000101","0010001","0001001","0010111"];
+const R=["1110010","1100110","1101100","1000010","1011100","1001110","1010000","1000100","1001000","1110100"];
+const P=["LLLLLL","LLGLGG","LLGGLG","LLGGGL","LGLLGG","LGGLLG","LGGGLL","LGLGLG","LGLGGL","LGGLGL"];
+function ean13Bits(code){
+  let bits="101";
+  const par=P[+code[0]];
+  for(let i=1;i<=6;i++){bits+=(par[i-1]==="L"?L:G)[+code[i]];}
+  bits+="01010";
+  for(let i=7;i<=12;i++){bits+=R[+code[i]];}
+  return bits+"101";
+}
+function ean13svg(code){
+  const bits=ean13Bits(code),w=2,q=18,h=70,W=bits.length*w+q*2;
+  let bars="";
+  for(let i=0;i<bits.length;i++){ if(bits[i]==="1") bars+=`<rect x="${q+i*w}" y="0" width="${w}" height="${h}" fill="#000"/>`; }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${W} ${h+22}"><rect width="${W}" height="${h+22}" fill="#fff"/>${bars}<text x="${W/2}" y="${h+17}" font-size="15" text-anchor="middle" font-family="monospace" letter-spacing="3">${code}</text></svg>`;
+}
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function show(d,isErr){
+  if(isErr){$("result").innerHTML=`<div class="card err">${esc(d.error||"Error")}</div>`;return;}
+  $("result").innerHTML=`<div class="card ok"><b>${esc(d.medicine_name)} ${esc(d.strength||"")}</b> - ${esc(d.facility)}
+    ${d.message?`<div style="margin-top:6px">${esc(d.message)}</div>`:""}
+    <div class="stats">
+      ${d.sold_now!==undefined?`<div class="stat"><b>${d.sold_now}</b>Sold now</div>`:""}
+      <div class="stat"><b>${d.sold_today}</b>Sold today</div>
+      <div class="stat"><b>${d.sold_total}</b>Total sold</div>
+      <div class="stat"><b>${d.stock_left}</b>Stock left (${esc(d.unit)})</div>
+    </div>
+    ${d.low_stock?`<p class="warn">Stock is at or below the minimum level (${d.min_stock_level}).</p>`:""}</div>`;
+}
+async function loadFacilities(){
+  const r=await fetch("/api/facilities");const f=await r.json();
+  $("facility").innerHTML=f.map(x=>`<option>${esc(x.name)}</option>`).join("");
+  const pref=f.find(x=>x.name==="PHC Kaniyur");if(pref)$("facility").value=pref.name;
+  loadSamples();
+}
+async function loadSamples(){
+  const r=await fetch("/api/barcodes?facility="+encodeURIComponent($("facility").value));
+  const list=await r.json();
+  $("samples").innerHTML=list.map(s=>`<div class="sample">${ean13svg(s.barcode)}
+    <div><b>${esc(s.medicine_name)} ${esc(s.strength||"")}</b></div>
+    <div style="font-size:.85rem;color:#475569">Stock here: ${s.stock_left!==undefined?s.stock_left:"-"}</div>
+    <button class="sec" style="margin-top:8px" onclick="useCode('${s.barcode}')">Use this barcode</button></div>`).join("");
+}
+function useCode(c){$("barcode").value=c;$("barcode").focus();}
+async function sell(){
+  const barcode=$("barcode").value.trim();if(!barcode)return;
+  const r=await fetch("/api/barcode/sale",{method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({barcode,quantity:$("qty").value,facility_name:$("facility").value})});
+  const d=await r.json();show(d,!r.ok);
+  if(r.ok){$("barcode").value="";$("qty").value=1;loadSamples();}
+  $("barcode").focus();
+}
+async function check(){
+  const barcode=$("barcode").value.trim();if(!barcode)return;
+  const r=await fetch("/api/barcode/"+encodeURIComponent(barcode)+"?facility="+encodeURIComponent($("facility").value));
+  show(await r.json(),!r.ok);
+}
+$("sellBtn").onclick=sell;$("checkBtn").onclick=check;
+$("barcode").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();sell();}});
+$("facility").addEventListener("change",loadSamples);
+loadFacilities();
+</script>
+</body>
+</html>'''
+
+@app.route("/scanner", methods=["GET"], strict_slashes=False)
+def barcode_scanner_page():
+    return Response(SCANNER_PAGE, mimetype="text/html")
 if __name__ == "__main__":
     init_db()
     app.run(host="127.0.0.1", port=5000, debug=True)
